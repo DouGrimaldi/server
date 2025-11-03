@@ -70,7 +70,9 @@ wss.on('connection', (ws) => {
             return;
         }
 
+        // --- BETTER DIAGNOSTICS ---
         console.log(`Received message type: ${data.type}`);
+        console.log('Received data:', JSON.stringify(data)); // Log the full message body
 
         switch (data.type) {
             // --- Host Messages ---
@@ -98,7 +100,9 @@ wss.on('connection', (ws) => {
                 break;
 
             // --- Player Messages ---
-            case 'join_room':
+            // --- FIX ---
+            // Changed 'join_room' to 'join' to match what your client is sending
+            case 'join':
                 const code = data.code.toUpperCase();
                 if (rooms[code]) {
                     const room = rooms[code];
@@ -121,6 +125,7 @@ wss.on('connection', (ws) => {
                         playerIndex: playerIndex 
                     });
                 } else {
+                    console.log(`Player tried to join non-existent room: ${code}`);
                     sendMessage(ws, { type: 'error', message: 'Room not found.' });
                 }
                 break;
@@ -134,6 +139,13 @@ wss.on('connection', (ws) => {
                         playerIndex: ws.playerIndex
                     });
                 }
+                break;
+            
+            // --- BETTER DIAGNOSTICS ---
+            // Added a default case to catch any unknown message types
+            default:
+                console.log(`Unhandled message type: ${data.type}`);
+                sendMessage(ws, { type: 'error', message: `Unknown message type: ${data.type}` });
                 break;
         }
     });
