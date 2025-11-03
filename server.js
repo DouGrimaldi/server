@@ -1,127 +1,173 @@
-// --- Spellbound Relay Server ---
-// This is our Node.js "post office" application.
-
-// Import the WebSocket library
 const WebSocket = require('ws');
 
-// Create a WebSocket server. We'll run it on port 8080.
-const wss = new WebSocket.Server({ port: 8080 });
+// Use the port Render provides, or 8080 for local testing
+const PORT = process.env.PORT || 8080;
 
-// This Map will store all our game rooms.
-// Key: "ABCD" (room code)
-// Value: { host: WebSocket, clients: [WebSocket, ...] }
-const rooms = new Map();
+// Create a new WebSocket server
+const wss = new WebSocket.Server({ port: PORT });
 
-console.log('Spellbound Relay Server is running on port 8080...');
+// This object will store our game rooms
+// Key: roomCode (e.g., "ABCD"), Value: { host: WebSocket, players: WebSocket[] }
+const rooms = {};
 
-// This function runs every time a new user (Godot or a phone) connects.
-wss.on('connection', ws => {
-    console.log('A new client connected.');
-
-    // This function runs when the server receives a message from this client.
-    ws.on('message', message => {
-        try {
-            const data = JSON.parse(message);
-            
-            // --- Handle specific message types ---
-
-            if (data.type === 'create_room') {
-                // This message comes from the Godot game (the host)
-                const roomCode = generateRoomCode();
-                ws.roomCode = roomCode; // Store the code on the host's connection
-                rooms.set(roomCode, {
-                    host: ws,
-                    clients: []
-                });
-                console.log(`Room ${roomCode} created by host.`);
-                
-                // Send the new code back to the Godot host
-                ws.send(JSON.stringify({ type: 'room_created', code: roomCode }));
-            }
-            else if (data.type === 'join_room') {
-                // This message comes from a player's phone
-                const room = rooms.get(data.code.toUpperCase());
-                
-                if (room) {
-                    // Room exists, add this player to it
-                    ws.roomCode = data.code.toUpperCase();
-                    ws.playerName = data.name;
-                    room.clients.push(ws);
-                    console.log(`Player ${data.name} joined room ${ws.roomCode}.`);
-                    
-                    // Tell the host (Godot) that a new player has joined
-                    room.host.send(JSON.stringify({
-                        type: 'player_joined',
-                        name: data.name,
-                        picture: data.picture // We just pass the Base64 data through
-                    }));
-                } else {
-                    // Room not found, send an error back to the phone
-                    ws.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
-                }
-            }
-            else {
-                // This is a generic relay message (like "buzz", "start_game", "next_turn")
-                const room = rooms.get(ws.roomCode);
-                if (!room) return;
-
-                if (room.host === ws) {
-                    // Message is FROM the host (Godot)
-                    // Relay it to ALL clients (phones) in that room
-                    room.clients.forEach(client => {
-                        client.send(message.toString());
-                    });
-                } else {
-                    // Message is FROM a client (phone)
-                    // Relay it ONLY to the host (Godot)
-                    room.host.send(message.toString());
-                }
-            }
-
-        } catch (error) {
-            console.error('Failed to parse message or handle logic:', error);
-        }
-    });
-
-    // This function runs when a client disconnects
-    ws.on('close', () => {
-        console.log('A client disconnected.');
-        const room = rooms.get(ws.roomCode);
-        if (!room) return;
-
-        if (room.host === ws) {
-            // The host (Godot) disconnected!
-            // Tell all clients to disconnect and delete the room
-            room.clients.forEach(client => {
-                client.send(JSON.stringify({ type: 'room_closed' }));
-                client.close();
-            });
-            rooms.delete(ws.roomCode);
-            console.log(`Room ${ws.roomCode} has been closed.`);
-        } else {
-            // A player (phone) disconnected
-            // Remove them from the clients list
-            room.clients = room.clients.filter(client => client !== ws);
-            
-            // Tell the host (Godot) that the player left
-            room.host.send(JSON.stringify({
-                type: 'player_left',
-                name: ws.playerName
-            }));
-            console.log(`Player ${ws.playerName} left room ${ws.roomCode}.`);
-        }
-    });
-});
-
-// Helper function to create a random 4-letter code
+/**
+ * Generates a random 4-letter room code.
+ */
 function generateRoomCode() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
     let code = '';
-    do {
-        code = '';
-        for (let i = 0; i < 4; i++) {
-            code += chars[Math.floor(Math.random() * chars.length)];
-        }
-    } while (rooms.has(code)); // Ensure code is unique
+    for (let i = 0; i < 4; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    // Ensure code is unique (unlikely collision, but good practice)
+    if (rooms[code]) {
+        return generateRoomCode();
+    }
     return code;
 }
+
+/**
+ * Sends a JSON message to a single WebSocket client.
+ * @param {WebSocket} ws The client to send to.
+ * @param {object} data The data object to send.
+ */
+function sendMessage(ws, data) {
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(data));
+    }
+}
+
+/**
+ * Sends a JSON message to all players in a room (but not the host).
+ * @param {object} room The game room object.
+ * @param {object} data The data object to send.
+ */
+function broadcastToPlayers(room, data) {
+    const message = JSON.stringify(data);
+    room.players.forEach(player => {
+        if (player.ws.readyState === WebSocket.OPEN) {
+            player.ws.send(message);
+        }
+    });
+}
+
+// --- Main Server Logic ---
+
+wss.on('connection', (ws) => {
+    console.log('A new client connected.');
+    
+    // Add a property to the client to track what room it's in
+    ws.roomCode = null;
+    ws.isHost = false;
+    ws.playerIndex = -1;
+
+    ws.on('message', (message) => {
+        let data;
+        try {
+            data = JSON.parse(message);
+        } catch (e) {
+            console.error('Failed to parse message:', message);
+            return;
+        }
+
+        console.log(`Received message type: ${data.type}`);
+
+        switch (data.type) {
+            // --- Host Messages ---
+            case 'create_room':
+                const roomCode = generateRoomCode();
+                ws.roomCode = roomCode;
+                ws.isHost = true;
+                
+                rooms[roomCode] = {
+                    host: ws,
+                    players: []
+                };
+                
+                console.log(`Host created room: ${roomCode}`);
+                sendMessage(ws, { type: 'room_created', code: roomCode });
+                break;
+
+            case 'start_game':
+            case 'next_turn':
+            case 'buzzer_lock':
+                if (ws.isHost && ws.roomCode && rooms[ws.roomCode]) {
+                    // Host is sending a message, broadcast it to all players in that room
+                    broadcastToPlayers(rooms[ws.roomCode], data);
+                }
+                break;
+
+            // --- Player Messages ---
+            case 'join_room':
+                const code = data.code.toUpperCase();
+                if (rooms[code]) {
+                    const room = rooms[code];
+                    const playerIndex = room.players.length;
+                    
+                    ws.roomCode = code;
+                    ws.playerIndex = playerIndex;
+                    room.players.push({ ws: ws, name: data.name, picture: data.picture });
+
+                    console.log(`Player "${data.name}" joined room: ${code}`);
+
+                    // Tell the player they joined successfully
+                    sendMessage(ws, { type: 'join_success', playerIndex: playerIndex });
+                    
+                    // Tell the host a new player joined
+                    sendMessage(room.host, { 
+                        type: 'player_joined', 
+                        name: data.name, 
+                        picture: data.picture,
+                        playerIndex: playerIndex 
+                    });
+                } else {
+                    sendMessage(ws, { type: 'error', message: 'Room not found.' });
+                }
+                break;
+            
+            case 'buzz':
+                if (!ws.isHost && ws.roomCode && rooms[ws.roomCode]) {
+                    const room = rooms[ws.roomCode];
+                    // Player is buzzing, forward this *only* to the host
+                    sendMessage(room.host, {
+                        type: 'player_buzzed',
+                        playerIndex: ws.playerIndex
+                    });
+                }
+                break;
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('Client disconnected.');
+        if (ws.roomCode && rooms[ws.roomCode]) {
+            const room = rooms[ws.roomCode];
+            if (ws.isHost) {
+                // Host disconnected, tell all players the room is closed
+                console.log(`Host for room ${ws.roomCode} disconnected. Closing room.`);
+                broadcastToPlayers(room, { type: 'error', message: 'The host disconnected.' });
+                delete rooms[ws.roomCode];
+            } else {
+                // Player disconnected, remove them from the list
+                const playerIndex = room.players.findIndex(p => p.ws === ws);
+                if (playerIndex > -1) {
+                    const removedPlayer = room.players.splice(playerIndex, 1)[0];
+                    console.log(`Player "${removedPlayer.name}" left room: ${ws.roomCode}`);
+                    
+                    // Tell the host a player left
+                    sendMessage(room.host, { type: 'player_left', playerIndex: ws.playerIndex });
+                    
+                    // Renumber remaining players (this is complex, skipping for now for simplicity)
+                    // For now, we just notify the host.
+                }
+            }
+        }
+    });
+
+    ws.on('error', (err) => {
+        console.error('WebSocket error:', err);
+    });
+});
+
+console.log(`Spelling Bee Relay Server is running on port ${PORT}...`);
+
