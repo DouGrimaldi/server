@@ -13,36 +13,26 @@ wss.on('connection', ws => {
         try {
             const data = JSON.parse(message);
             
-            // --- This block is for messages that don't require the client to be in a room yet ---
             if (data.type === 'create_room') {
                 const roomCode = generateRoomCode();
                 ws.roomCode = roomCode; 
-                rooms.set(roomCode, {
-                    host: ws,
-                    clients: [],
-                    isGameInProgress: false // --- NEW: Track game state ---
-                });
+                rooms.set(roomCode, { host: ws, clients: [] });
                 console.log(`Room ${roomCode} created by host.`);
                 ws.send(JSON.stringify({ type: 'room_created', code: roomCode }));
-                return; // Stop processing here
+                return;
             }
             else if (data.type === 'join_room') {
                 const roomCode = data.code.toUpperCase();
                 const room = rooms.get(roomCode);
-                
                 if (room) {
-                    // --- MODIFIED: Prevent players with the same name from joining ---
                     if (room.clients.some(client => client.playerName === data.name.toUpperCase())) {
                         ws.send(JSON.stringify({ type: 'error', message: 'Name is already taken.' }));
                         return;
                     }
-
                     ws.roomCode = roomCode;
-                    ws.playerName = data.name.toUpperCase(); // Store name on the connection
+                    ws.playerName = data.name.toUpperCase();
                     room.clients.push(ws);
                     console.log(`Player ${ws.playerName} joined room ${ws.roomCode}.`);
-                    
-                    // Tell the host a player joined. The host will decide if it's a new player or a reconnect.
                     room.host.send(JSON.stringify({
                         type: 'player_joined',
                         name: ws.playerName,
@@ -51,45 +41,32 @@ wss.on('connection', ws => {
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
                 }
-                return; // Stop processing here
+                return;
             }
 
-            // --- All other messages require the client to be in a room ---
             const room = rooms.get(ws.roomCode);
             if (!room) return;
 
-            // --- NEW: Handle a targeted message from the host to a specific client ---
-            if (data.type === 'force_start_client' && room.host === ws) {
-                const clientToStart = room.clients.find(c => c.playerName === data.name);
-                if (clientToStart) {
-                    console.log(`Forcing start for reconnected player: ${data.name}`);
-                    clientToStart.send(JSON.stringify({ type: 'game_started' }));
-                }
-                return;
-            }
-            
-            // --- NEW: Host tells server the game has started ---
-            if (data.type === 'start_game' && room.host === ws) {
-                room.isGameInProgress = true;
-            }
-
-
-            // Generic relay logic (for buzz, next_turn, etc.)
+            // --- MODIFIED: Added routing for new message types ---
             if (room.host === ws) {
-                // Message is FROM the host (Godot), send to ALL clients
-                room.clients.forEach(client => {
-                    client.send(message.toString());
-                });
+                // Message is FROM the host (Godot)
+                if (data.type === 'sync_board_state') {
+                    // Send to a specific player
+                    const client = room.clients.find(c => c.playerName === data.name);
+                    if (client) {
+                        client.send(message.toString());
+                    }
+                } else {
+                    // Broadcast to ALL clients (start_game, next_turn, board_update, etc.)
+                    room.clients.forEach(client => {
+                        client.send(message.toString());
+                    });
+                }
             } else {
-                // Message is FROM a client (phone), send ONLY to the host
-                // --- MODIFIED: Include playerIndex with buzz ---
-                const playerIndex = room.clients.indexOf(ws);
-                const buzzMessage = {
-                    type: 'player_buzzed',
-                    name: ws.playerName,
-                    playerIndex: playerIndex
-                };
-                room.host.send(JSON.stringify(buzzMessage));
+                // Message is FROM a client (phone) -> Relay to host
+                const playerIndex = room.clients.findIndex(c => c === ws);
+                data.playerIndex = playerIndex; // Add playerIndex to every message from client
+                room.host.send(JSON.stringify(data));
             }
 
         } catch (error) {
@@ -101,9 +78,7 @@ wss.on('connection', ws => {
         console.log('A client disconnected.');
         const room = rooms.get(ws.roomCode);
         if (!room) return;
-
         if (room.host === ws) {
-            // The host disconnected, close the entire room.
             room.clients.forEach(client => {
                 client.send(JSON.stringify({ type: 'room_closed' }));
                 client.close();
@@ -111,15 +86,13 @@ wss.on('connection', ws => {
             rooms.delete(ws.roomCode);
             console.log(`Room ${ws.roomCode} has been closed.`);
         } else {
-            // A player disconnected
-            // --- MODIFIED: Just remove them from the active connections list ---
-            // We no longer notify the host, allowing them to reconnect.
             room.clients = room.clients.filter(client => client !== ws);
-            console.log(`Player ${ws.playerName} disconnected from room ${ws.roomCode}. Connections remaining: ${room.clients.length}`);
+            console.log(`Player ${ws.playerName} disconnected. Connections: ${room.clients.length}`);
         }
     });
 });
 
+function generateRoomCode() { /* ... unchanged ... */ }
 function generateRoomCode() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
     let code = '';
@@ -131,3 +104,4 @@ function generateRoomCode() {
     } while (rooms.has(code));
     return code;
 }
+
