@@ -1,97 +1,92 @@
-// --- Spellbound Relay Server ---
-// This is our Node.js "post office" application.
+// --- Spellbound Relay Server (Upgraded for HTTP Pings) ---
 
-// Import the WebSocket library
+// Import both the WebSocket and the standard HTTP library
 const WebSocket = require('ws');
+const http = require('http');
 
-// Create a WebSocket server. We'll run it on port 8080.
-const wss = new WebSocket.Server({ port: 8080 });
+// 1. Create a standard HTTP server. This will be our main server.
+const server = http.createServer((req, res) => {
+    // This function handles any standard HTTP requests (like from UptimeRobot)
+    // We send a simple "OK" response to show that the server is alive.
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Spellbound Relay Server is alive.');
+    console.log('Received HTTP ping. Responded with 200 OK.');
+});
 
-// This Map will store all our game rooms.
-// Key: "ABCD" (room code)
-// Value: { host: WebSocket, clients: [WebSocket, ...] }
+
+// 2. Create a WebSocket server, but tell it NOT to start its own server.
+// Instead, we will attach it to our existing HTTP server.
+const wss = new WebSocket.Server({ noServer: true });
+
+// This Map will store all our game rooms. (This logic is unchanged)
 const rooms = new Map();
 
-console.log('Spellbound Relay Server is running on port 8080...');
 
-// This function runs every time a new user (Godot or a phone) connects.
+// 3. Listen for the 'upgrade' event on our HTTP server.
+// This event happens when a client tries to connect with WebSockets (ws://)
+server.on('upgrade', (request, socket, head) => {
+    console.log('WebSocket upgrade request received. Handing off to ws server...');
+    // We hand off the request to the 'ws' library to handle the WebSocket handshake.
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        // Once the handshake is complete, the 'ws' library gives us the connection,
+        // and we emit it to our own connection logic.
+        wss.emit('connection', ws, request);
+    });
+});
+
+
+// --- All of your existing WebSocket logic goes here, completely unchanged ---
 wss.on('connection', ws => {
-    console.log('A new client connected.');
+    console.log('A new WebSocket client connected.');
 
-    // This function runs when the server receives a message from this client.
     ws.on('message', message => {
         try {
             const data = JSON.parse(message);
             
-            // --- Handle specific message types ---
-
             if (data.type === 'create_room') {
-                // This message comes from the Godot game (the host)
                 const roomCode = generateRoomCode();
-                ws.roomCode = roomCode; // Store the code on the host's connection
-                rooms.set(roomCode, {
-                    host: ws,
-                    clients: []
-                });
+                ws.roomCode = roomCode; 
+                rooms.set(roomCode, { host: ws, clients: [] });
                 console.log(`Room ${roomCode} created by host.`);
-                
-                // Send the new code back to the Godot host
                 ws.send(JSON.stringify({ type: 'room_created', code: roomCode }));
                 return;
             }
             else if (data.type === 'join_room') {
-                // This message comes from a player's phone
                 const roomCode = data.code.toUpperCase();
                 const room = rooms.get(roomCode);
-                
                 if (room) {
-                    // Prevent players with the same name from joining
                     if (room.clients.some(client => client.playerName === data.name.toUpperCase())) {
                         ws.send(JSON.stringify({ type: 'error', message: 'Name is already taken.' }));
                         return;
                     }
-
-                    // Room exists, add this player to it
                     ws.roomCode = roomCode;
                     ws.playerName = data.name.toUpperCase();
                     room.clients.push(ws);
                     console.log(`Player ${ws.playerName} joined room ${ws.roomCode}.`);
-                    
-                    // Tell the host (Godot) that a new player has joined
                     room.host.send(JSON.stringify({
                         type: 'player_joined',
                         name: ws.playerName,
                         picture: data.picture
                     }));
                 } else {
-                    // Room not found, send an error back to the phone
                     ws.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
                 }
                 return;
             }
 
-            // All other messages require the client to be in a room
             const room = rooms.get(ws.roomCode);
             if (!room) return;
 
             if (room.host === ws) {
-                // Message is FROM the host (Godot)
                 if (data.type === 'sync_board_state') {
-                    // Send to a specific player
                     const client = room.clients.find(c => c.playerName === data.name);
-                    if (client) {
-                        client.send(message.toString());
-                    }
+                    if (client) { client.send(message.toString()); }
                 } else {
-                    // Broadcast to ALL clients (start_game, next_turn, board_update, scores_updated etc.)
-                    room.clients.forEach(client => {
-                        client.send(message.toString());
-                    });
+                    room.clients.forEach(client => { client.send(message.toString()); });
                 }
             } else {
-                // Message is FROM a client (phone) -> Relay to host
                 const playerIndex = room.clients.findIndex(c => c === ws);
-                data.playerIndex = playerIndex; // Add playerIndex to every message from client
+                data.playerIndex = playerIndex;
                 room.host.send(JSON.stringify(data));
             }
 
@@ -100,15 +95,11 @@ wss.on('connection', ws => {
         }
     });
 
-    // This function runs when a client disconnects
     ws.on('close', () => {
-        console.log('A client disconnected.');
+        console.log('A WebSocket client disconnected.');
         const room = rooms.get(ws.roomCode);
         if (!room) return;
-
         if (room.host === ws) {
-            // The host (Godot) disconnected!
-            // Tell all clients to disconnect and delete the room
             room.clients.forEach(client => {
                 client.send(JSON.stringify({ type: 'room_closed' }));
                 client.close();
@@ -116,15 +107,12 @@ wss.on('connection', ws => {
             rooms.delete(ws.roomCode);
             console.log(`Room ${ws.roomCode} has been closed.`);
         } else {
-            // A player (phone) disconnected
-            // Remove them from the active connections list
             room.clients = room.clients.filter(client => client !== ws);
-            console.log(`Player ${ws.playerName} disconnected from room ${ws.roomCode}. Connections remaining: ${room.clients.length}`);
+            console.log(`Player ${ws.playerName} disconnected. Connections: ${room.clients.length}`);
         }
     });
 });
 
-// Helper function to create a random 4-letter code
 function generateRoomCode() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
     let code = '';
@@ -133,6 +121,14 @@ function generateRoomCode() {
         for (let i = 0; i < 4; i++) {
             code += chars[Math.floor(Math.random() * chars.length)];
         }
-    } while (rooms.has(code)); // Ensure code is unique
+    } while (rooms.has(code));
     return code;
 }
+
+
+// 4. Start the HTTP server. Render provides the port in an environment variable.
+// We fall back to 8080 for local testing.
+const port = process.env.PORT || 8080;
+server.listen(port, () => {
+    console.log(`Spellbound Relay Server is running on port ${port}...`);
+});
